@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"fmt"
 	"strings"
 
 	"golang.stackrox.io/kube-linter/pkg/objectkinds"
@@ -11,61 +12,76 @@ import (
 )
 
 func reconcileResourceList(client discovery.DiscoveryInterface, scheme *runtime.Scheme) ([]metav1.APIResource, error) {
-	apiResources := []metav1.APIResource{}
-	apiResourceSet := map[schema.GroupKind]metav1.APIResource{}
+	set := newResourceSet(scheme)
 
 	_, apiResourceLists, err := client.ServerGroupsAndResources()
 	if err != nil {
 		return nil, err
 	}
 
-	for _, apiResourceList := range apiResourceLists {
-		gv, err := schema.ParseGroupVersion(apiResourceList.GroupVersion)
+	for _, list := range apiResourceLists {
+		gv, err := schema.ParseGroupVersion(list.GroupVersion)
 		if err != nil {
-			return nil, err
+			return nil, fmt.Errorf("parsing GroupVersion: %w", err)
 		}
-		for _, apiResource := range apiResourceList.APIResources {
-			// skip sub resources (pods/scale, deployment/status...)
-			if isSubResource(&apiResource) {
-				continue
-			}
-			apiResource.Group = gv.Group
-			apiResource.Version = gv.Version
 
-			canValidate, err := isRegisteredKubeLinterKind(apiResource)
-			if err != nil {
-				return nil, err
-			}
-			if !canValidate {
-				continue
+		for _, rsc := range list.APIResources {
+			rsc.Group, rsc.Version = gv.Group, gv.Version
+
+			key := schema.GroupKind{
+				Group: gv.Group,
+				Kind:  rsc.Kind,
 			}
 
-			if !isRegisteredInScheme(&apiResource, scheme) {
-				continue
+			if err := set.Add(key, rsc); err != nil {
+				return nil, fmt.Errorf("adding resource to set: %w", err)
 			}
-
-			gk := schema.GroupKind{
-				Group: apiResource.Group,
-				Kind:  apiResource.Kind,
-			}
-			existing, ok := apiResourceSet[gk]
-			if !ok {
-				apiResourceSet[gk] = apiResource
-				continue
-			}
-			priorityGV := getPriorityVersion(existing.Group, existing.Version, apiResource.Version, scheme)
-			existing.Version = priorityGV
-			apiResourceSet[gk] = existing
 		}
 	}
-	for _, v := range apiResourceSet {
-		apiResources = append(apiResources, v)
-	}
-	return apiResources, nil
+
+	return set.ToSlice(), nil
 }
 
-func getPriorityVersion(group, existingVer, currentVer string, scheme *runtime.Scheme) string {
-	gv := scheme.PrioritizedVersionsAllGroups()
+func newResourceSet(scheme *runtime.Scheme) *resourceSet {
+	return &resourceSet{
+		scheme: scheme,
+		data:   make(map[schema.GroupKind]metav1.APIResource),
+	}
+}
+
+type resourceSet struct {
+	scheme *runtime.Scheme
+	data   map[schema.GroupKind]metav1.APIResource
+}
+
+func (s *resourceSet) Add(key schema.GroupKind, val metav1.APIResource) error {
+	if isSubResource(val) {
+		return nil
+	}
+
+	if ok, err := isRegisteredKubeLinterKind(val); err != nil {
+		return fmt.Errorf("checking if resource is registered KubeLinter kind: %w", err)
+	} else if !ok {
+		return nil
+	}
+
+	if !s.scheme.Recognizes(gvkFromMetav1APIResource(val)) {
+		return nil
+	}
+
+	if existing, ok := s.data[key]; ok {
+		existing.Version = s.getPriorityVersion(existing.Group, existing.Version, val.Version)
+
+		s.data[key] = existing
+	} else {
+		s.data[key] = val
+	}
+
+	return nil
+}
+
+func (s *resourceSet) getPriorityVersion(group, existingVer, currentVer string) string {
+	gv := s.scheme.PrioritizedVersionsAllGroups()
 	for _, v := range gv {
 		if v.Version == existingVer {
 			return existingVer
@@ -77,8 +93,18 @@ func getPriorityVersion(group, existingVer, currentVer string, scheme *runtime.S
 	return existingVer
 }
 
+func (s *resourceSet) ToSlice() []metav1.APIResource {
+	res := make([]metav1.APIResource, 0, len(s.data))
+
+	for _, v := range s.data {
+		res = append(res, v)
+	}
+
+	return res
+}
+
 // isSubResource returns true if the apiResource.Name has a "/" in it eg: pod/status
-func isSubResource(apiResource *metav1.APIResource) bool {
+func isSubResource(apiResource metav1.APIResource) bool {
 	return strings.Contains(apiResource.Name, "/")
 }
 
@@ -115,13 +141,4 @@ func gvkFromMetav1APIResource(rsc metav1.APIResource) schema.GroupVersionKind {
 		Version: rsc.Version,
 		Kind:    rsc.Kind,
 	}
-}
-
-func isRegisteredInScheme(apiResource *metav1.APIResource, scheme *runtime.Scheme) bool {
-	gvk := schema.GroupVersionKind{
-		Group:   apiResource.Group,
-		Version: apiResource.Version,
-		Kind:    apiResource.Kind,
-	}
-	return scheme.Recognizes(gvk)
 }
